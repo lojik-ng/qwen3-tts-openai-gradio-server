@@ -17,3 +17,5 @@ Aside from accepting voice parameter on api, it should also accept response_form
 It should support multiple requests at the same time by processing them in a queue.
 
 It should support apiKey authentication in the header (openAI compatible). Api keys should be checked against the keys.json file. Do not copy the keys.json file in the docker files but map it so that it is accessed on the host.
+
+Build the docker image and run it.
