@@ -1,0 +1,49 @@
+services:
+  qwen3-tts:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: qwen3-tts-server
+
+    # GPU access - using runtime for better compatibility
+    runtime: nvidia
+
+    # Port mapping
+    ports:
+      - "3010:3010" # Gradio UI
+      - "3011:3011" # OpenAI-compatible API
+
+    # Volume mapping - voices folder on host
+    volumes:
+      - ./voices:/app/voices:ro
+      - ./keys.json:/app/keys.json:ro
+      # Optional: Model cache to avoid re-downloading
+      - qwen3-tts-cache:/root/.cache/huggingface
+
+    # Environment variables
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - CUDA_VISIBLE_DEVICES=0
+      - HF_HOME=/root/.cache/huggingface
+      # Optional: Hugging Face token for private models
+      # - HF_TOKEN=${HF_TOKEN}
+
+      # Restart policy
+    restart: unless-stopped
+
+    # Shared memory size for PyTorch
+    shm_size: '8gb'
+
+    # Health check
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:3011/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 180s
+
+# Named volumes for persistent storage
+volumes:
+  qwen3-tts-cache:
+    driver: local

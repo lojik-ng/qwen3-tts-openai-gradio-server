@@ -1,0 +1,46 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv
+venv
+ENV
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# Build artifacts
+*.egg-info
+dist
+build
+
+# Temp files
+*.log
+*.tmp
+.DS_Store
+
+# Don't copy voices - they are mounted
+# voices/
+
+# Documentation
+*.md
+!README.md
+
+# Tests
+tests/
+pytest.ini
+.pytest_cache
+
+# Docker
+Dockerfile*
+docker-compose*.yml
+.docker
