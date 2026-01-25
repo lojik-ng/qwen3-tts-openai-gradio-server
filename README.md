@@ -40,7 +40,7 @@ voices/
 
 ```bash
 # Build and run with Docker Compose
-docker-compose up -d --build
+docker compose up -d --build
 
 # Note: The server uses API Key authentication.
 # Update keys.json with your own keys before deployment.
