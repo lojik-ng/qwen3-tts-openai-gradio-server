@@ -140,12 +140,17 @@ def convert_audio_format(audio: np.ndarray, sr: int, format: str) -> bytes:
                 "ffmpeg", "-y",
                 "-i", temp_wav_path,
                 "-ac", "1",  # Mono
-                "-ar", str(sr),
                 "-loglevel", "error"
             ]
             
             if format == "mp3":
-                cmd.extend(["-acodec", "libmp3lame", "-q:a", "2"])
+                # 22,050 Hz, mono, 32 kbps, signed 16-bit
+                cmd.extend([
+                    "-ar", "22050",
+                    "-acodec", "libmp3lame",
+                    "-b:a", "32k",
+                    "-sample_fmt", "s16p"  # signed 16-bit planar (MP3 standard)
+                ])
             elif format == "aac":
                 cmd.extend(["-acodec", "aac", "-b:a", "128k"])
             elif format == "opus":
