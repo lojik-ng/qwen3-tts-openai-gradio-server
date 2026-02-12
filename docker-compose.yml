@@ -32,7 +32,7 @@ services:
     restart: unless-stopped
 
     # Shared memory size for PyTorch
-    shm_size: '8gb'
+    shm_size: '4gb'
 
     # Health check
     healthcheck:
