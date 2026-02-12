@@ -24,7 +24,6 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
-      - CUDA_VISIBLE_DEVICES=0
       - HF_HOME=/root/.cache/huggingface
       # Optional: Hugging Face token for private models
       # - HF_TOKEN=${HF_TOKEN}
