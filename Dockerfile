@@ -4,7 +4,7 @@
 # ============================================================================
 # Stage 1: Base with CUDA and Python
 # ============================================================================
-FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04 AS base
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04 AS base
 
 # Prevent interactive prompts during package installation
 ENV DEBIAN_FRONTEND=noninteractive
