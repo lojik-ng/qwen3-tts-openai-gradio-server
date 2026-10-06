@@ -7,19 +7,20 @@ import io
 import os
 import base64
 import time
+import asyncio
 from typing import Optional, Literal, List
 from pathlib import Path
 
 import numpy as np
 import soundfile as sf
 import json
-from fastapi import FastAPI, HTTPException, Response, Query, Depends, Security
+from fastapi import FastAPI, HTTPException, Response, Query, Depends, Security, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 
 # Import TTS Manager properly
 # We use the factory function to get the shared instance
-from tts_model import get_tts_manager
+from tts_model import ClientDisconnected, get_tts_manager
 
 # ============================================================================
 # Pydantic Models
@@ -270,49 +271,124 @@ async def list_voices():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/v1/audio/speech", dependencies=[Depends(verify_api_key)])
-async def create_speech(request: SpeechRequest):
+class _ClientGone:
+    """Thread-safe 'is the caller still connected?' flag for one request.
+
+    asyncio.to_thread runs the real work on a worker thread, which cannot await
+    the ASGI receive channel. So we watch for the disconnect on the event loop
+    and publish a plain bool the worker can poll without touching asyncio.
+
+    The request body is already consumed by FastAPI before this handler runs, so
+    any further http.disconnect message means the client hung up.
     """
-    Generate speech from text (OpenAI-compatible endpoint)
-    
-    This endpoint is compatible with OpenAI's /v1/audio/speech API.
-    The main difference is that 'voice' must be a voice name from your
-    voices folder instead of OpenAI's preset voices.
+
+    def __init__(self, request: Request):
+        self._gone = False
+        self._task = asyncio.create_task(self._watch(request))
+
+    async def _watch(self, request: Request) -> None:
+        try:
+            # await receive() blocks until the peer disconnects; the loop is
+            # otherwise idle here, so this costs nothing until it happens.
+            while True:
+                message = await request.receive()
+                if message["type"] == "http.disconnect":
+                    self._gone = True
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Never let a watcher failure take down the request it guards.
+            pass
+
+    def __call__(self) -> bool:
+        """Safe to call from a worker thread: reads a bool, touches no asyncio."""
+        return self._gone
+
+    def cancel(self) -> None:
+        self._task.cancel()
+
+
+def _synthesize(request: SpeechRequest, should_abort=None) -> Response:
+    """Blocking TTS generation + format conversion; must run off the event loop
+
+    should_abort is polled while queued for the GPU so an abandoned request does
+    not hold the inference slot. None disables the check.
     """
+    manager = get_tts_manager()
+
+    # Validate voice exists
+    available_voices = manager.get_available_voices()
+    if request.voice not in available_voices:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Voice '{request.voice}' not found. Available voices: {available_voices}",
+        )
+
+    # Generate speech (inference is serialized by the manager's lock)
+    audio, sr = manager.generate_speech(
+        text=request.input,
+        voice_name=request.voice,
+        language=request.language,
+        should_abort=should_abort,
+    )
+
+    # Convert to requested format
+    audio_bytes = convert_audio_format(audio, sr, request.response_format)
+    content_type = get_content_type(request.response_format)
+
+    return Response(
+        content=audio_bytes,
+        media_type=content_type,
+        headers={
+            "Content-Disposition": f"attachment; filename=speech.{request.response_format}",
+        },
+    )
+
+
+async def _create_speech(request: SpeechRequest, watcher) -> Response:
+    """Shared handler body: synthesize, translating a vanished client to a no-op.
+
+    watcher is any zero-arg callable returning True once the caller is gone.
+    """
+    queued_at = time.time()
     try:
-        manager = get_tts_manager()
-        
-        # Validate voice exists
-        available_voices = manager.get_available_voices()
-        if request.voice not in available_voices:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Voice '{request.voice}' not found. Available voices: {available_voices}",
-            )
-        
-        # Generate speech (this call is thread-safe inside the manager)
-        audio, sr = manager.generate_speech(
-            text=request.input,
-            voice_name=request.voice,
-            language=request.language,
+        # Blocking inference + ffmpeg conversion must not stall the event
+        # loop, or every other request (health, voices, queued speech)
+        # waits the full generation time.
+        return await asyncio.to_thread(_synthesize, request, watcher)
+    except ClientDisconnected:
+        # Nobody is left to answer; the work was skipped, which is the point.
+        # No 'ran' figure exists -- that is the whole saving, so it stays absent.
+        print(
+            f"[tts] dropped: client disconnected while queued after "
+            f"{time.time() - queued_at:.1f}s "
+            f"({len(request.input)} chars, no audio generated)",
+            flush=True,
         )
-        
-        # Convert to requested format
-        audio_bytes = convert_audio_format(audio, sr, request.response_format)
-        content_type = get_content_type(request.response_format)
-        
-        return Response(
-            content=audio_bytes,
-            media_type=content_type,
-            headers={
-                "Content-Disposition": f"attachment; filename=speech.{request.response_format}",
-            },
-        )
-        
+        return Response(status_code=499)
+    except HTTPException:
+        raise
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/v1/audio/speech", dependencies=[Depends(verify_api_key)])
+async def create_speech(request: SpeechRequest, http_request: Request):
+    """
+    Generate speech from text (OpenAI-compatible endpoint)
+
+    This endpoint is compatible with OpenAI's /v1/audio/speech API.
+    The main difference is that 'voice' must be a voice name from your
+    voices folder instead of OpenAI's preset voices.
+    """
+    watcher = _ClientGone(http_request)
+    try:
+        return await _create_speech(request, watcher)
+    finally:
+        watcher.cancel()
 
 
 # Alternative endpoint that accepts query parameters (for simpler testing)
@@ -322,6 +398,7 @@ async def create_speech_get(
     voice: str = Query(..., description="Voice name to use"),
     response_format: str = Query("wav", description="Audio format"),
     language: str = Query("Auto", description="Language"),
+    http_request: Request = None,
 ):
     """GET version of speech endpoint for easier testing"""
     request = SpeechRequest(
@@ -330,7 +407,13 @@ async def create_speech_get(
         response_format=response_format,
         language=language,
     )
-    return await create_speech(request)
+    # Watched exactly like POST: this endpoint feeds scripts that abandon
+    # requests just as easily, and it queues on the same lock.
+    watcher = _ClientGone(http_request)
+    try:
+        return await _create_speech(request, watcher)
+    finally:
+        watcher.cancel()
 
 
 @app.post("/v1/voices/{voice_name}/reload", dependencies=[Depends(verify_api_key)])
@@ -338,7 +421,7 @@ async def reload_voice(voice_name: str):
     """Reload a specific voice (useful if voice files are updated)"""
     try:
         manager = get_tts_manager()
-        manager.reload_voice(voice_name)
+        await asyncio.to_thread(manager.reload_voice, voice_name)
         return {"status": "success", "message": f"Voice '{voice_name}' reloaded"}
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))

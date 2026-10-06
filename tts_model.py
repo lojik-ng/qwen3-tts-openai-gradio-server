@@ -8,8 +8,16 @@ import time
 import torch
 import threading
 from pathlib import Path
-from typing import Optional, Tuple, Dict, List
+from typing import Callable, Optional, Tuple, Dict, List
 import numpy as np
+
+
+class ClientDisconnected(Exception):
+    """Raised when the caller vanished while queued for the GPU.
+
+    The audio was never generated, so no synthesis work was wasted. Distinct from
+    a failure: there is nobody left to return an error to.
+    """
 
 
 def _check_cuda_available() -> bool:
@@ -69,41 +77,58 @@ class TTSModelManager:
             self._device = "cpu"
             dtype = torch.float32
         
-        # Try loading with flash attention first (if CUDA available)
-        attn_impl = "flash_attention_2" if cuda_available else "eager"
-        
-        try:
-            self._model = Qwen3TTSModel.from_pretrained(
-                self.MODEL_ID,
-                device_map=self._device,
-                dtype=dtype,
-                attn_implementation=attn_impl,
-            )
-            print(f"Model loaded successfully on {self._device} with {attn_impl}")
-        except Exception as e:
-            print(f"Error loading with {attn_impl}, falling back to eager: {e}")
+        # Attention, best first, and every rung tried rather than two.
+        #
+        # flash_attention_2 stays at the head because it is the fastest where it
+        # exists. It does not exist here: there is no usable flash-attn wheel for
+        # an RTX 5090, compute capability 12.0, on CUDA 13, and the Dockerfile's
+        # source build already falls back instead of succeeding.
+        #
+        # sdpa is the rung that was missing, and the only one actually available.
+        # It ships with torch. Measured on this box, same model and voice:
+        # 0.78x realtime against eager's 1.22x, flat from 46 to 796 character
+        # requests in both cases. Eager does not degrade with length; it is
+        # simply 56% dearer every time.
+        #
+        # That is not merely a speed figure. Generation is serialised behind
+        # self._lock while the API accepts requests concurrently, so the time one
+        # request takes is time every other request spends queueing, and a queue
+        # longer than the caller's timeout is what "the server hung" means here.
+        #
+        # eager stays last. It is correct, just dear.
+        candidates = ["flash_attention_2", "sdpa", "eager"] if cuda_available else ["eager"]
+
+        last_error = None
+        for attn_impl in candidates:
             try:
                 self._model = Qwen3TTSModel.from_pretrained(
                     self.MODEL_ID,
                     device_map=self._device,
                     dtype=dtype,
-                    attn_implementation="eager",
+                    attn_implementation=attn_impl,
                 )
-                print(f"Model loaded with eager attention on {self._device}")
-            except Exception as e2:
-                # If CUDA failed, try CPU as last resort
-                if self._device != "cpu":
-                    print(f"GPU loading failed, falling back to CPU: {e2}")
-                    self._device = "cpu"
-                    self._model = Qwen3TTSModel.from_pretrained(
-                        self.MODEL_ID,
-                        device_map="cpu",
-                        dtype=torch.float32,
-                        attn_implementation="eager",
-                    )
-                    print("Model loaded on CPU as fallback")
-                else:
-                    raise
+                self._attn = attn_impl
+                print(f"Model loaded successfully on {self._device} with {attn_impl}")
+                return
+            except Exception as e:
+                last_error = e
+                print(f"Could not load with {attn_impl}: {e}")
+
+        # Every implementation failed on the card, so the card is the problem
+        # rather than the attention. CPU is slow, but it answers.
+        if self._device != "cpu":
+            print(f"GPU loading failed, falling back to CPU: {last_error}")
+            self._device = "cpu"
+            self._model = Qwen3TTSModel.from_pretrained(
+                self.MODEL_ID,
+                device_map="cpu",
+                dtype=torch.float32,
+                attn_implementation="eager",
+            )
+            self._attn = "eager"
+            print("Model loaded on CPU as fallback")
+        else:
+            raise last_error
     
     @property
     def model(self):
@@ -161,11 +186,45 @@ class TTSModelManager:
         
         return prompt
     
+    # How often a queued request re-checks whether its client is still there.
+    # 0.5s bounds how long an abandoned request keeps holding a place in line.
+    QUEUE_POLL_INTERVAL = 0.5
+
+    def _acquire(self, should_abort: Optional[Callable[[], bool]]) -> float:
+        """Acquire the inference lock, giving up if the caller disconnects.
+
+        On return the lock is held and the caller owns it; generate_speech's
+        finally block releases it. Returns the queue wait in seconds.
+
+        Raises ClientDisconnected without ever touching the model if the client
+        goes away first, so the GPU slot goes to the next live request instead of
+        being burnt on audio nobody will collect. On that path the lock is left
+        exactly as it was found.
+
+        Without should_abort (the Gradio path) this is the old plain blocking
+        acquire. The polling loop is required: acquire() cannot be interrupted, and
+        an abandoned thread that woke up later and grabbed the lock anyway would
+        wedge every other request forever.
+        """
+        if should_abort is None:
+            started = time.time()
+            self._lock.acquire()
+            return time.time() - started
+
+        started = time.time()
+        while not self._lock.acquire(timeout=self.QUEUE_POLL_INTERVAL):
+            if should_abort():
+                raise ClientDisconnected(
+                    "client disconnected while queued for inference"
+                )
+        return time.time() - started
+
     def generate_speech(
         self,
         text: str,
         voice_name: str,
         language: str = "Auto",
+        should_abort: Optional[Callable[[], bool]] = None,
     ) -> Tuple[np.ndarray, int]:
         """
         Generate speech for the given text using the specified voice
@@ -174,25 +233,55 @@ class TTSModelManager:
             text: Text to synthesize
             voice_name: Name of the voice to use (from voices folder)
             language: Language code (Auto, English, Chinese, etc.)
-            
+            should_abort: Optional callable polled while queued; if it returns
+                True the client is gone and ClientDisconnected is raised without
+                generating anything. None means "no liveness signal" (Gradio).
+
+        Raises:
+            ClientDisconnected: caller vanished while waiting for the lock.
+
         Returns:
             Tuple of (audio_array, sample_rate)
         """
-        # Get or create voice prompt
-        # We lock here to prevent race conditions in prompt creation/cache if multiple calls come for same voice
-        # But more importantly, to Serialize the inference
-        with self._lock:
+        # Get or create voice prompt, then run, serialised.
+        #
+        # Queue time is measured apart from run time on purpose. The API accepts
+        # requests concurrently through asyncio.to_thread and they all meet this
+        # one lock, so a caller that waited two minutes cannot tell whether the
+        # server was slow or simply busy behind somebody else's line. Those are
+        # different faults with different fixes.
+        waited = self._acquire(should_abort)
+        try:
             voice_prompt = self.get_voice_prompt(voice_name)
-            
-            # Generate audio
+
+            started = time.time()
             wavs, sr = self._model.generate_voice_clone(
                 text=text,
                 language=language,
                 voice_clone_prompt=voice_prompt,
             )
-            
+            took = time.time() - started
+
+            audio = (len(wavs[0]) / sr) if sr else 0.0
+            if audio:
+                print(
+                    f"[tts] {len(text):4d} chars  {self._attn}  queued {waited:5.1f}s  "
+                    f"ran {took:5.1f}s  audio {audio:5.1f}s  {took / audio:4.2f}x",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[tts] {len(text):4d} chars  {self._attn}  queued {waited:5.1f}s  "
+                    f"ran {took:5.1f}s  NO AUDIO",
+                    flush=True,
+                )
+
             return wavs[0], sr
-    
+        finally:
+            # Always release, including when generation raises. A leaked lock
+            # would stall every future request until the container restarted.
+            self._lock.release()
+
     def reload_voice(self, voice_name: str):
         """Force reload a voice prompt (e.g., if files were updated)"""
         if voice_name in self._voice_prompts:
